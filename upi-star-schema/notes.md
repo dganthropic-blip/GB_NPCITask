@@ -100,11 +100,16 @@
     `ALTER`, `CREATE`, `ATTACH`, `COPY`, `EXPORT`, `IMPORT`), and the
     query must start with `SELECT` or `WITH` — enforced in Python before
     the string ever reaches DuckDB.
-15. **`bd_pct`/`td_pct` stop at the ingestion layer.** They're parsed and
-    available on the raw mandate DataFrames but intentionally excluded
-    from `fact_monthly`, which only carries the columns the spec defines
-    (`creation_approved_pct`, `execution_approved_pct`,
-    `execution_ratio_pct`).
+15. **`bd_pct`/`td_pct` are carried into `fact_monthly`** as
+    `creation_bd_pct`/`creation_td_pct` and
+    `execution_bd_pct`/`execution_td_pct`. They were originally dropped
+    at the schema-build step to match the exact column list in the
+    initial build spec, but that threw away real diagnostic signal —
+    BD (Business Decline: insufficient funds, limit exceeded, customer
+    rejected) vs. TD (Technical Decline: timeout, server error) explains
+    *why* a bank's approval rate is low, which is exactly the kind of
+    thing the chat agent gets asked. Reinstated so `approved_pct +
+    bd_pct + td_pct ≈ 100%` is queryable per bank-month.
 
 ## 3. Star schema diagram
 
@@ -125,21 +130,25 @@
                      │      │      │
         ┌────────────┘      │      └────────────┐
         │                   │                   │
-┌───────┴────────┐  ┌───────┴────────┐  ┌────────┴───────┐
-│ fact_monthly   │  │fact_monthly_agg│  │  fact_monthly  │
-│    _agg        │  │  (same table,  │  │  (bank x month)│
-│ (month grain)  │  │  shown twice   │  │────────────────│
-│────────────────│  │  for clarity)  │  │ bank_key    FK ─┼──┐
-│ month_key   FK │  └────────────────┘  │ month_key   FK  │  │
-│ volume_mn      │                      │ mandates_created│  │
-│ value_cr       │                      │ mandates_executed│ │
-│ avg_daily_vol  │                      │ creation_appr_% │  │
-│ avg_daily_val  │                      │ execution_appr_%│  │
-│ ats_rs         │                      │ execution_ratio%│  │
-│ volume_mom_%   │                      └────────┬─────────┘  │
-│ value_mom_%    │                               │            │
-│ ats_mom_%      │                               ▼            │
-└────────────────┘                      ┌────────────────┐    │
+┌───────┴────────┐  ┌───────┴────────┐  ┌──────────────────┐
+│ fact_monthly   │  │fact_monthly_agg│  │   fact_monthly    │
+│    _agg        │  │  (same table,  │  │  (bank x month)   │
+│ (month grain)  │  │  shown twice   │  │───────────────────│
+│────────────────│  │  for clarity)  │  │ bank_key      FK ─┼──┐
+│ month_key   FK │  └────────────────┘  │ month_key     FK  │  │
+│ volume_mn      │                      │ mandates_created  │  │
+│ value_cr       │                      │ mandates_executed │  │
+│ avg_daily_vol  │                      │ creation_appr_%   │  │
+│ avg_daily_val  │                      │ creation_bd_%     │  │
+│ ats_rs         │                      │ creation_td_%     │  │
+│ volume_mom_%   │                      │ execution_appr_%  │  │
+│ value_mom_%    │                      │ execution_bd_%    │  │
+│ ats_mom_%      │                      │ execution_td_%    │  │
+└────────────────┘                      │ execution_ratio%  │  │
+                                         └─────────┬─────────┘  │
+                                                    │            │
+                                                    ▼            │
+                                         ┌────────────────┐    │
                                          │   dim_bank     │◄───┘
                                          │────────────────│
                                          │ bank_key PK    │
@@ -204,8 +213,15 @@ month-end can only execute the following month.)
 | `mandates_created`          | fact_monthly       | Count of UPI mandates created by a bank in a month (`total_volume` from the creation file) |
 | `mandates_executed`         | fact_monthly       | Count of UPI mandates executed by a bank in a month (`total_volume` from the execution file) |
 | `creation_approved_pct`     | fact_monthly       | `approved_pct` from the creation file (% of created mandates approved) |
+| `creation_bd_pct`           | fact_monthly       | % of created mandates Business-Declined (insufficient funds, limit exceeded, customer rejected) |
+| `creation_td_pct`           | fact_monthly       | % of created mandates Technically Declined (timeout, server error — infra failure) |
 | `execution_approved_pct`    | fact_monthly       | `approved_pct` from the execution file (% of executed mandates approved) |
+| `execution_bd_pct`          | fact_monthly       | % of executed mandates Business-Declined |
+| `execution_td_pct`          | fact_monthly       | % of executed mandates Technically Declined |
 | `execution_ratio_pct`       | fact_monthly       | `mandates_executed / mandates_created * 100`, same bank-month     |
+
+For both creation and execution, `approved_pct + bd_pct + td_pct ≈ 100%`
+per bank-month.
 
 ## 6. LLM provider: Gemini (Google AI Studio)
 

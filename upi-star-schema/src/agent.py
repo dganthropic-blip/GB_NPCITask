@@ -27,7 +27,7 @@ SCHEMA (DuckDB SQL):
   dim_date(date_key PK, full_date DATE, day INT, month_num INT, year INT, month_name TEXT, month_short TEXT, day_name TEXT, day_of_week INT, is_weekend BOOL)
   dim_bank(bank_key PK, bank_name TEXT)
   fact_monthly_agg(month_key FK→dim_month, volume_mn FLOAT, value_cr FLOAT, avg_daily_volume_mn FLOAT, avg_daily_value_cr FLOAT, ats_rs FLOAT, volume_mom_pct FLOAT, value_mom_pct FLOAT, ats_mom_pct FLOAT)
-  fact_monthly(bank_key FK→dim_bank, month_key FK→dim_month, mandates_created INT, mandates_executed INT, creation_approved_pct FLOAT, execution_approved_pct FLOAT, execution_ratio_pct FLOAT)
+  fact_monthly(bank_key FK→dim_bank, month_key FK→dim_month, mandates_created INT, mandates_executed INT, creation_approved_pct FLOAT, creation_bd_pct FLOAT, creation_td_pct FLOAT, execution_approved_pct FLOAT, execution_bd_pct FLOAT, execution_td_pct FLOAT, execution_ratio_pct FLOAT)
   fact_daily(date_key FK→dim_date, volume_mn FLOAT, value_cr FLOAT, ats_rs FLOAT)
 
 DATA COVERAGE:
@@ -40,6 +40,7 @@ KEY CONSTRAINT: Transaction volume/value is AGGREGATE only (no bank split). Bank
 
 UNITS: volume_mn = millions of transactions, value_cr = ₹ crores, ats_rs = ₹ per transaction.
 ATS FORMULA: ats_rs = (value_cr × 10^7) / (volume_mn × 10^6). Pre-computed in ats_rs column.
+MANDATE DECLINE BREAKDOWN: for each bank-month, approved_pct + bd_pct + td_pct ≈ 100%. bd_pct = Business Decline (customer/bank rejected the request — insufficient funds, limit exceeded, risk hold). td_pct = Technical Decline (infra failure — timeout, server error — unrelated to the transaction itself). A low approved_pct with high bd_pct points to a business/policy issue; high td_pct points to a technical/infra issue.
 
 SQL PATTERNS:
 - Latest month: SELECT ... FROM fact_monthly_agg f JOIN dim_month m ON f.month_key = m.month_key ORDER BY m.month_date DESC LIMIT 1

@@ -121,18 +121,24 @@ def _build_fact_monthly(
     bank_map = dict(zip(dim_bank["bank_name"], dim_bank["bank_key"]))
     month_map = dict(zip(dim_month["month_date"], dim_month["month_key"]))
 
-    def _prep(df: pd.DataFrame, volume_col: str, pct_col: str) -> pd.DataFrame:
+    def _prep(df: pd.DataFrame, volume_col: str, prefix: str) -> pd.DataFrame:
         d = df.copy()
         d["bank_key"] = d["bank_name"].map(bank_map)
         d["month_key"] = d["month_date"].map(month_map)
         d = d.dropna(subset=["bank_key", "month_key"])
         d["bank_key"] = d["bank_key"].astype(int)
         d["month_key"] = d["month_key"].astype(int)
-        d = d.rename(columns={"total_volume": volume_col, "approved_pct": pct_col})
-        return d[["bank_key", "month_key", volume_col, pct_col]]
+        d = d.rename(columns={
+            "total_volume": volume_col,
+            "approved_pct": f"{prefix}_approved_pct",
+            "bd_pct": f"{prefix}_bd_pct",
+            "td_pct": f"{prefix}_td_pct",
+        })
+        cols = ["bank_key", "month_key", volume_col, f"{prefix}_approved_pct", f"{prefix}_bd_pct", f"{prefix}_td_pct"]
+        return d[[c for c in cols if c in d.columns]]
 
-    creation = _prep(creation_df, "mandates_created", "creation_approved_pct")
-    execution = _prep(execution_df, "mandates_executed", "execution_approved_pct")
+    creation = _prep(creation_df, "mandates_created", "creation")
+    execution = _prep(execution_df, "mandates_executed", "execution")
 
     # Outer join → banks/months absent from one side become NULL, never zero.
     merged = creation.merge(execution, on=["bank_key", "month_key"], how="outer")
@@ -148,7 +154,9 @@ def _build_fact_monthly(
 
     cols = [
         "bank_key", "month_key", "mandates_created", "mandates_executed",
-        "creation_approved_pct", "execution_approved_pct", "execution_ratio_pct",
+        "creation_approved_pct", "creation_bd_pct", "creation_td_pct",
+        "execution_approved_pct", "execution_bd_pct", "execution_td_pct",
+        "execution_ratio_pct",
     ]
     return merged[cols].sort_values(["month_key", "bank_key"]).reset_index(drop=True)
 
