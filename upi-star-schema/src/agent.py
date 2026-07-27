@@ -16,7 +16,7 @@ from google.genai.errors import ClientError, ServerError
 
 from src.tools import SchemaQueryEngine, TOOL_DEFINITIONS
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-flash-latest"
 
 SYSTEM_PROMPT = """You are a UPI data analyst. You answer questions by writing SQL queries against a star schema. NEVER guess or use general knowledge — always query first, then answer from the results.
 
@@ -73,7 +73,7 @@ _NETWORK_ERRORS = (
 
 class UPIAgent:
     def __init__(self, schemas: Dict, model: str = MODEL_NAME):
-        api_key = os.environ.get("GEMINI_API_KEY", "AIzaSyBTHfQhwHee2yhBLpVR5BA_M9CfZL3tttQ")
+        api_key = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
         self.client = genai.Client(api_key=api_key)
         self.model = model
         self.engine = SchemaQueryEngine(schemas)

@@ -210,8 +210,8 @@ month-end can only execute the following month.)
 ## 6. LLM provider: Gemini (Google AI Studio)
 
 The agent was switched from Groq to Gemini (`google-genai` SDK,
-`gemini-2.5-flash`, Google AI Studio key). Everything downstream of the
-LLM call is provider-agnostic — `src/tools.py` (SQL engine + tool
+`gemini-flash-latest`, Google AI Studio key). Everything downstream of
+the LLM call is provider-agnostic — `src/tools.py` (SQL engine + tool
 definitions), the Flask routes, and the web UI are unchanged. Only
 `src/agent.py` and `requirements.txt` differ:
 
@@ -234,21 +234,20 @@ definitions), the Flask routes, and the web UI are unchanged. Only
   limit (429, retried with backoff), auth/permission (401/403), transient
   server error (5xx, retried), and network failure.
 
-**Live-tested finding, not a code issue:** the Google AI Studio key
-supplied for this project (`AIzaSyBTHf...`) authenticates successfully —
-`ListModels` and `CountTokens` both return `200` — but every
-`generateContent` call is rejected: `gemini-2.5-flash`, `gemini-2.5-pro`,
-and `gemini-2.5-flash-lite` all return `403 PERMISSION_DENIED: "Your
-project has been denied access. Please contact support."`, and
-`gemini-2.0-flash` returns `429 RESOURCE_EXHAUSTED` with a free-tier
-quota of `0` requests/day. This is an account/project-level restriction
-on Google's side (likely billing not enabled, or the project pending
-verification) — it reproduces identically via raw `curl`, independent of
-this codebase or the sandbox's network proxy. Check
-https://aistudio.google.com/ for the project's billing/status, or
-generate a fresh key, then re-run; no code changes should be needed once
-the key has real access. The tool-calling loop itself was validated as
-far as possible without a live `generateContent` response: the exact
-`TOOL_DEFINITIONS` schema was constructed as real `FunctionDeclaration`
-objects and passed Gemini's own pydantic validation, and the retry/error
-paths were exercised against the real `403`/`429` responses above.
+**Model pin — `gemini-flash-latest`, not `gemini-2.5-flash`.** The first
+two API keys tried for this project authenticated fine (`ListModels` /
+`CountTokens` returned `200`) but every `generateContent` call was
+rejected with `403 PERMISSION_DENIED: "Your project has been denied
+access. Please contact support."` on `gemini-2.5-*` models, and
+`gemini-2.0-flash` returned `429 RESOURCE_EXHAUSTED` with a free-tier
+quota of `0` — an account/project-level restriction, reproduced
+identically via raw `curl`, independent of this codebase. A third key
+cleared that block but hit a different, more informative error on
+`gemini-2.5-flash`: `404 "This model ... is no longer available to new
+users."` — the Google account behind that key was created after
+`2.5-flash`/`2.5-flash-lite` were closed to new signups. `ListModels`
+against that key confirmed `gemini-flash-latest` (a stable, Google-
+maintained alias for the current recommended Flash model) is available
+and works. Live-tested end to end with real questions — multi-turn
+follow-ups, multi-step `run_sql` chains, and markdown table rendering in
+the UI all confirmed working against the real Gemini API.
