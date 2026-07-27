@@ -71,8 +71,10 @@
    it can't quietly distort a trend or MoM comparison.
 5. **CSV cache, not Parquet.** The processed tables are small (<400 rows
    each); CSV avoids adding a `pyarrow` dependency for no real benefit.
-6. **Groq free tier (`llama-3.3-70b-versatile`).** No billing setup
-   needed to run or demo the agent.
+6. **Gemini API via Google AI Studio (`gemini-2.5-flash`).** Function
+   calling is manual (`automatic_function_calling` disabled) so every
+   tool call can be captured into `tools_used` for the UI's query-audit
+   trail — the SDK's own auto-calling loop would hide that from us.
 7. **Text-to-SQL, no pre-built query functions.** The agent has no
    `get_trend()`/`get_top_banks()`-style tools — it writes SQL itself via
    `run_sql`, so it can answer questions beyond the ones anticipated here.
@@ -205,14 +207,48 @@ month-end can only execute the following month.)
 | `execution_approved_pct`    | fact_monthly       | `approved_pct` from the execution file (% of executed mandates approved) |
 | `execution_ratio_pct`       | fact_monthly       | `mandates_executed / mandates_created * 100`, same bank-month     |
 
-## 6. Known limitation of this build environment
+## 6. LLM provider: Gemini (Google AI Studio)
 
-This project was assembled and tested without a live `GROQ_API_KEY` (none
-was present in the environment). The full pipeline — Excel ingestion,
-star-schema build, DuckDB query engine, SQL validation, Flask routes, and
-the web UI (chat bubbles, markdown rendering, query-audit trail, typing
-indicator, Data Lineage / Schema panels, mobile layout) — was exercised
-end to end via `build_schemas.py`, Flask's test client, and a headless
-browser, and all behave as specified. The one thing not exercised against
-a real endpoint is the Groq model's actual SQL-writing behavior; set
-`GROQ_API_KEY` (or edit the fallback in `src/agent.py`) to try it live.
+The agent was switched from Groq to Gemini (`google-genai` SDK,
+`gemini-2.5-flash`, Google AI Studio key). Everything downstream of the
+LLM call is provider-agnostic — `src/tools.py` (SQL engine + tool
+definitions), the Flask routes, and the web UI are unchanged. Only
+`src/agent.py` and `requirements.txt` differ:
+
+- `client.models.generate_content(..., config=GenerateContentConfig(tools=[...]))`
+  replaces Groq's OpenAI-compatible `chat.completions.create`.
+- `automatic_function_calling` is explicitly disabled — Gemini's SDK can
+  run the tool loop for you, but that would hide each call from the
+  `tools_used` audit trail the UI depends on. The loop in `chat()` stays
+  manual, matching the original design.
+- Gemini returns `FunctionCall.args` as an already-parsed dict (no
+  `json.loads` needed, unlike Groq's JSON-string arguments).
+- Gemini's chat history only recognizes `role="user"` and `role="model"`
+  — there's no dedicated `"tool"` role. A function response is sent back
+  as a `role="user"` `Content` containing a `function_response` part;
+  `_trim_messages` treats only *plain-text* `role="user"` turns as
+  cut points, so a `function_call`/`function_response` pair can never be
+  split by trimming.
+- Error handling maps `google.genai.errors.ClientError`/`ServerError`
+  (with a numeric `.code`) onto the same four buckets as before: rate
+  limit (429, retried with backoff), auth/permission (401/403), transient
+  server error (5xx, retried), and network failure.
+
+**Live-tested finding, not a code issue:** the Google AI Studio key
+supplied for this project (`AIzaSyBTHf...`) authenticates successfully —
+`ListModels` and `CountTokens` both return `200` — but every
+`generateContent` call is rejected: `gemini-2.5-flash`, `gemini-2.5-pro`,
+and `gemini-2.5-flash-lite` all return `403 PERMISSION_DENIED: "Your
+project has been denied access. Please contact support."`, and
+`gemini-2.0-flash` returns `429 RESOURCE_EXHAUSTED` with a free-tier
+quota of `0` requests/day. This is an account/project-level restriction
+on Google's side (likely billing not enabled, or the project pending
+verification) — it reproduces identically via raw `curl`, independent of
+this codebase or the sandbox's network proxy. Check
+https://aistudio.google.com/ for the project's billing/status, or
+generate a fresh key, then re-run; no code changes should be needed once
+the key has real access. The tool-calling loop itself was validated as
+far as possible without a live `generateContent` response: the exact
+`TOOL_DEFINITIONS` schema was constructed as real `FunctionDeclaration`
+objects and passed Gemini's own pydantic validation, and the retry/error
+paths were exercised against the real `403`/`429` responses above.

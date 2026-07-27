@@ -1,4 +1,4 @@
-"""Groq-powered agentic loop. The LLM is a text-to-SQL analyst: it discovers
+"""Gemini-powered agentic loop. The LLM is a text-to-SQL analyst: it discovers
 the schema, writes SQL, runs it via SchemaQueryEngine, and answers from the
 results. No pre-built "get_trend"-style query functions exist on purpose —
 the model composes SQL at runtime for whatever question it's asked.
@@ -8,19 +8,15 @@ import os
 import time
 from typing import Dict, List, Optional
 
-from groq import Groq
-
-try:
-    from groq import APIConnectionError, APITimeoutError, AuthenticationError, RateLimitError
-except ImportError:  # pragma: no cover - defensive import for older groq versions
-    APIConnectionError = ConnectionError
-    APITimeoutError = Exception
-    AuthenticationError = Exception
-    RateLimitError = Exception
+import httpx
+import requests
+from google import genai
+from google.genai import types
+from google.genai.errors import ClientError, ServerError
 
 from src.tools import SchemaQueryEngine, TOOL_DEFINITIONS
 
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = "gemini-2.5-flash"
 
 SYSTEM_PROMPT = """You are a UPI data analyst. You answer questions by writing SQL queries against a star schema. NEVER guess or use general knowledge — always query first, then answer from the results.
 
@@ -65,85 +61,107 @@ _MAX_MESSAGES = 20
 _MAX_ITERATIONS = 10
 _MAX_RETRIES = 3
 
+_NETWORK_ERRORS = (
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    ConnectionError,
+    TimeoutError,
+)
+
 
 class UPIAgent:
     def __init__(self, schemas: Dict, model: str = MODEL_NAME):
-        api_key = os.environ.get("GROQ_API_KEY", "gsk_YOUR_KEY_HERE")
-        self.client = Groq(api_key=api_key)
+        api_key = os.environ.get("GEMINI_API_KEY", "AIzaSyBTHfQhwHee2yhBLpVR5BA_M9CfZL3tttQ")
+        self.client = genai.Client(api_key=api_key)
         self.model = model
         self.engine = SchemaQueryEngine(schemas)
-        self.messages: List[Dict] = []
+        self.contents: List[types.Content] = []
+
+        function_declarations = [
+            types.FunctionDeclaration(
+                name=t["name"],
+                description=t["description"],
+                parameters=t["input_schema"],
+            )
+            for t in TOOL_DEFINITIONS
+        ]
+        self._tool = types.Tool(function_declarations=function_declarations)
+        self._config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            tools=[self._tool],
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
 
     def reset(self) -> None:
-        self.messages = []
+        self.contents = []
 
     # -- message trimming -----------------------------------------------------
 
+    @staticmethod
+    def _is_user_question(content: types.Content) -> bool:
+        """True for a real new user question, not a function-response turn."""
+        if content.role != "user":
+            return False
+        parts = content.parts or []
+        return all(getattr(p, "function_response", None) is None for p in parts)
+
     def _trim_messages(self) -> None:
-        """Keep the last ~20 messages, but only cut at a user-message boundary
-        so a tool_call/tool_result pair never gets split."""
-        if len(self.messages) <= _MAX_MESSAGES:
+        """Keep the last ~20 turns, but only cut at a user-question boundary
+        so a function_call/function_response pair never gets split."""
+        if len(self.contents) <= _MAX_MESSAGES:
             return
-        target = len(self.messages) - _MAX_MESSAGES
+        target = len(self.contents) - _MAX_MESSAGES
         cut_at = None
-        for i in range(target, len(self.messages)):
-            if self.messages[i].get("role") == "user":
+        for i in range(target, len(self.contents)):
+            if self._is_user_question(self.contents[i]):
                 cut_at = i
                 break
         if cut_at is not None:
-            self.messages = self.messages[cut_at:]
-
-    # -- tool format conversion -----------------------------------------------
-
-    def _convert_tools(self) -> List[Dict]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "parameters": t["input_schema"],
-                },
-            }
-            for t in TOOL_DEFINITIONS
-        ]
+            self.contents = self.contents[cut_at:]
 
     # -- tool dispatch ---------------------------------------------------------
 
-    def _execute_tool(self, name: str, args: Dict) -> str:
+    def _execute_tool(self, name: str, args: Dict) -> Dict:
         if name == "describe_tables":
-            return self.engine.describe_tables(args.get("table_name"))
-        if name == "query_daily_stats":
-            return self.engine.query_daily_stats(
+            result = self.engine.describe_tables(args.get("table_name"))
+        elif name == "query_daily_stats":
+            result = self.engine.query_daily_stats(
                 date_from=args.get("date_from"),
                 date_to=args.get("date_to"),
                 limit=args.get("limit", 31),
             )
-        if name == "run_sql":
-            return self.engine.run_sql(args.get("query", ""))
-        return json.dumps({"error": f"Unknown tool '{name}'"})
+        elif name == "run_sql":
+            result = self.engine.run_sql(args.get("query", ""))
+        else:
+            result = json.dumps({"error": f"Unknown tool '{name}'"})
 
-    # -- Groq API call with retry -----------------------------------------------
+        try:
+            parsed = json.loads(result)
+        except json.JSONDecodeError:
+            parsed = result
+        return {"result": parsed}
 
-    def _call_api(self, tools: List[Dict]):
+    # -- Gemini API call with retry ---------------------------------------------
+
+    def _call_api(self):
         last_exc = None
         for attempt in range(_MAX_RETRIES):
             try:
-                return self.client.chat.completions.create(
+                return self.client.models.generate_content(
                     model=self.model,
-                    messages=self.messages,
-                    tools=tools,
-                    tool_choice="auto",
+                    contents=self.contents,
+                    config=self._config,
                 )
-            except (RateLimitError, APITimeoutError) as exc:
+            except ServerError as exc:
                 last_exc = exc
                 if attempt < _MAX_RETRIES - 1:
                     time.sleep(1 if attempt == 0 else 2)
                     continue
                 raise
-            except Exception as exc:  # noqa: BLE001
-                status = getattr(exc, "status_code", None)
-                if status is not None and status >= 500 and attempt < _MAX_RETRIES - 1:
+            except ClientError as exc:
+                if exc.code == 429 and attempt < _MAX_RETRIES - 1:
                     last_exc = exc
                     time.sleep(1 if attempt == 0 else 2)
                     continue
@@ -156,13 +174,8 @@ class UPIAgent:
         """Returns {"response": str, "tools_used": [{"tool": name, "args": {...}}]}"""
         tools_used: List[Dict] = []
 
-        if not self.messages:
-            self.messages.append({"role": "system", "content": SYSTEM_PROMPT})
-
         self._trim_messages()
-        self.messages.append({"role": "user", "content": user_message})
-
-        tools = self._convert_tools()
+        self.contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_message)]))
 
         try:
             iterations = 0
@@ -171,46 +184,36 @@ class UPIAgent:
                 if iterations > _MAX_ITERATIONS:
                     return {"response": "Unable to answer within allowed steps.", "tools_used": tools_used}
 
-                response = self._call_api(tools)
-                message = response.choices[0].message
+                response = self._call_api()
+                function_calls = response.function_calls
 
-                if message.tool_calls:
-                    self.messages.append({
-                        "role": "assistant",
-                        "content": message.content or "",
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                            }
-                            for tc in message.tool_calls
-                        ],
-                    })
+                if function_calls:
+                    self.contents.append(response.candidates[0].content)
 
-                    for tc in message.tool_calls:
-                        try:
-                            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-                        except json.JSONDecodeError:
-                            args = {}
+                    response_parts = []
+                    for fc in function_calls:
+                        args = dict(fc.args) if fc.args else {}
+                        tools_used.append({"tool": fc.name, "args": args})
+                        tool_result = self._execute_tool(fc.name, args)
+                        response_parts.append(
+                            types.Part.from_function_response(name=fc.name, response=tool_result)
+                        )
 
-                        tools_used.append({"tool": tc.function.name, "args": args})
-                        result = self._execute_tool(tc.function.name, args)
-
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result,
-                        })
+                    self.contents.append(types.Content(role="user", parts=response_parts))
                 else:
-                    self.messages.append({"role": "assistant", "content": message.content})
-                    return {"response": message.content, "tools_used": tools_used}
+                    answer = response.text or ""
+                    self.contents.append(types.Content(role="model", parts=[types.Part.from_text(text=answer)]))
+                    return {"response": answer, "tools_used": tools_used}
 
-        except RateLimitError:
-            return {"response": "Rate limit exceeded, try again in a moment.", "tools_used": tools_used}
-        except AuthenticationError:
-            return {"response": "API key invalid or expired. Set GROQ_API_KEY to a valid key.", "tools_used": tools_used}
-        except (APITimeoutError, APIConnectionError, ConnectionError):
-            return {"response": "Unable to reach the Groq API. Check your network connection.", "tools_used": tools_used}
+        except ClientError as exc:
+            if exc.code == 429:
+                return {"response": "Rate limit exceeded, try again in a moment.", "tools_used": tools_used}
+            if exc.code in (401, 403) or "api key" in str(exc).lower():
+                return {"response": "API key invalid or expired (or access denied). Set GEMINI_API_KEY to a valid key.", "tools_used": tools_used}
+            return {"response": f"Unexpected error: {str(exc)[:200]}", "tools_used": tools_used}
+        except ServerError:
+            return {"response": "Unable to reach the Gemini API — server error, try again shortly.", "tools_used": tools_used}
+        except _NETWORK_ERRORS:
+            return {"response": "Unable to reach the Gemini API. Check your network connection.", "tools_used": tools_used}
         except Exception as exc:  # noqa: BLE001
             return {"response": f"Unexpected error: {str(exc)[:200]}", "tools_used": tools_used}

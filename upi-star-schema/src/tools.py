@@ -161,7 +161,8 @@ class SchemaQueryEngine:
 
 
 # ---------------------------------------------------------------------------
-# Tool definitions (OpenAI/Groq-compatible function-calling schema)
+# Tool definitions (Gemini function-calling schema: name/description/input_schema
+# map directly onto FunctionDeclaration name/description/parameters)
 # ---------------------------------------------------------------------------
 
 TOOL_DEFINITIONS = [
